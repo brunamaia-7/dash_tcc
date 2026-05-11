@@ -22,12 +22,137 @@ from pathlib import Path
 if not os.path.exists('assets'):
     os.makedirs('assets')
 
+# ===================== FUNÇÕES DE PRECIPITAÇÃO (GPM + CHIRPS) =====================
+def get_gpm_precip(start_date, end_date, geometry):
+    """
+    Retorna precipitação média (mm/h) usando GPM IMERG
+    """
+    try:
+        collection = (ee.ImageCollection("NASA/GPM_L3/IMERG_V06")
+                      .filterDate(start_date, end_date)
+                      .select("precipitationCal"))
+        
+        image = collection.mean()
+        
+        stats = image.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geometry,
+            scale=10000,
+            maxPixels=1e9
+        )
+        result = stats.getInfo()
+        return result.get('precipitationCal', None), None
+    except Exception as e:
+        return None, str(e)
+
+def get_chirps_precip(start_date, end_date, geometry):
+    """
+    Retorna precipitação acumulada (mm) usando CHIRPS
+    """
+    try:
+        collection = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+                      .filterDate(start_date, end_date)
+                      .select("precipitation"))
+        
+        image = collection.sum()
+        
+        stats = image.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geometry,
+            scale=5000,
+            maxPixels=1e9
+        )
+        result = stats.getInfo()
+        return result.get('precipitation', None), None
+    except Exception as e:
+        return None, str(e)
+
+def get_precip_series(start_date, end_date, geometry, source='both'):
+    """
+    Retorna série temporal de precipitação
+    source: 'gpm', 'chirps', ou 'both'
+    """
+    results = {}
+    errors = {}
+    
+    if source in ['gpm', 'both']:
+        # Para GPM - dados mensais
+        gpm_data = []
+        current_date = datetime.strptime(start_date, '%Y-%m-%d')
+        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        while current_date <= end_date_obj:
+            month_start = current_date.strftime('%Y-%m-%d')
+            if current_date.month == 12:
+                next_date = current_date.replace(year=current_date.year + 1, month=1, day=1)
+            else:
+                next_date = current_date.replace(month=current_date.month + 1, day=1)
+            month_end = (next_date - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            
+            try:
+                collection = (ee.ImageCollection("NASA/GPM_L3/IMERG_V06")
+                              .filterDate(month_start, month_end)
+                              .select("precipitationCal"))
+                image = collection.mean()
+                stats = image.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geometry,
+                    scale=10000,
+                    maxPixels=1e9
+                )
+                value = stats.getInfo().get('precipitationCal', None)
+                if value:
+                    gpm_data.append({'date': current_date.strftime('%Y-%m'), 'precip': value, 'source': 'GPM'})
+            except Exception as e:
+                errors['GPM'] = str(e)
+            
+            current_date = next_date
+        
+        results['gpm'] = pd.DataFrame(gpm_data) if gpm_data else None
+    
+    if source in ['chirps', 'both']:
+        # Para CHIRPS - dados diários agregados por mês
+        chirps_data = []
+        current_date = datetime.strptime(start_date, '%Y-%m-%d')
+        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        while current_date <= end_date_obj:
+            month_start = current_date.strftime('%Y-%m-%d')
+            if current_date.month == 12:
+                next_date = current_date.replace(year=current_date.year + 1, month=1, day=1)
+            else:
+                next_date = current_date.replace(month=current_date.month + 1, day=1)
+            month_end = (next_date - pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            
+            try:
+                collection = (ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+                              .filterDate(month_start, month_end)
+                              .select("precipitation"))
+                image = collection.sum()
+                stats = image.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=geometry,
+                    scale=5000,
+                    maxPixels=1e9
+                )
+                value = stats.getInfo().get('precipitation', None)
+                if value:
+                    chirps_data.append({'date': current_date.strftime('%Y-%m'), 'precip': value, 'source': 'CHIRPS'})
+            except Exception as e:
+                errors['CHIRPS'] = str(e)
+            
+            current_date = next_date
+        
+        results['chirps'] = pd.DataFrame(chirps_data) if chirps_data else None
+    
+    return results, errors if errors else None
+
 # Inicialização do Earth Engine
 # ===================== CONFIGURAÇÃO EARTH ENGINE =====================
 def initialize_earth_engine():
     try:
-        ee.Initialize(project='ee-brunamaiiia')  # 🔥 FORÇA SEU PROJETO
-        st.sidebar.success("✅ Earth Engine inicializado (projeto correto)")
+        ee.Initialize(project='ee-brunamaiiia')
+        st.sidebar.success("✅ Earth Engine inicializado")
         return True
     except Exception as e:
         try:
@@ -40,14 +165,14 @@ def initialize_earth_engine():
                     key_data=private_key
                 )
                 
-                ee.Initialize(credentials, project='ee-brunamaiiia')  # 🔥 AQUI TAMBÉM
+                ee.Initialize(credentials, project='ee-brunamaiiia')
                 st.sidebar.success("✅ Earth Engine inicializado (Service Account)")
                 return True
             else:
                 st.sidebar.warning("⚠️ Earth Engine sem autenticação")
                 return False
         except Exception as e:
-            st.sidebar.error(f"❌ Erro real: {str(e)}")
+            st.sidebar.error(f"❌ Erro: {str(e)}")
             return False
 
 # Inicializar Earth Engine
@@ -56,11 +181,11 @@ ee_initialized = initialize_earth_engine()
 # Configuração da página
 st.set_page_config(
     layout='wide',
-    page_title="🌊 Análise de Água - Bacia do Pericumã",
+    page_title="🌊 Análise de Água + Precipitação - Bacia do Pericumã",
     page_icon="🌊"
 )
 
-# ===================== ESTILOS E CSS =====================
+# ===================== ESTILOS E CSS (mantido seu original) =====================
 st.markdown("""
 <style>
     .main-header {
@@ -81,6 +206,13 @@ st.markdown("""
         padding: 1.5rem;
         border-radius: 15px;
         border-left: 5px solid #2196F3;
+        margin-bottom: 1rem;
+    }
+    .precip-card {
+        background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%);
+        padding: 1.5rem;
+        border-radius: 15px;
+        border-left: 5px solid #4CAF50;
         margin-bottom: 1rem;
     }
     .info-box {
@@ -117,27 +249,12 @@ st.markdown("""
         box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         margin-bottom: 2rem;
     }
-    .correlation-high {
-        background-color: #E8F5E8 !important;
-    }
-    .correlation-medium {
-        background-color: #FFF8E1 !important;
-    }
-    .correlation-low {
-        background-color: #FFEBEE !important;
-    }
-    .download-section {
-        background: #F5F5F5;
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ===================== CABEÇALHO =====================
 st.markdown('<h1 class="main-header">WebApp para monitoramento da superfície de água na bacia hidrográfica do rio Pericumã</h1>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Monitoramento da dinâmica de corpos d\'água através do MapBiomas Água Collection 4</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-header">Monitoramento da dinâmica de corpos d\'água + análise de precipitação (GPM e CHIRPS)</p>', unsafe_allow_html=True)
 
 # ===================== CONFIGURAÇÃO DA BACIA =====================
 PERICUMA_ASSET = 'projects/ee-brunamaiiia/assets/Bacia_Pericuma_ZEE_v2'
@@ -150,12 +267,14 @@ WATER_VALUE = 1
 
 # ===================== SIDEBAR =====================
 with st.sidebar:
-    # Logos no topo do sidebar (pequenas, lado a lado)
+    # Logos no topo do sidebar
     col1, col2 = st.columns([1, 1])
     with col1:
-        st.image("assets/lageos.jpeg", width=80)
+        if os.path.exists("assets/lageos.jpeg"):
+            st.image("assets/lageos.jpeg", width=80)
     with col2:
-        st.image("assets/brasao-normal.png", width=80)
+        if os.path.exists("assets/brasao-normal.png"):
+            st.image("assets/brasao-normal.png", width=80)
 
     st.markdown("### ⚙️ Configurações de Análise")
     
@@ -169,6 +288,28 @@ with st.sidebar:
         default=[2022, 2010, 2000, 1990, 1985],
         help="Selecione os anos para análise temporal"
     )
+    
+    st.markdown("---")
+    st.markdown("### 🌧️ Configurações de Precipitação")
+    
+    use_precip = st.checkbox("📊 Incluir análise de precipitação", value=True)
+    
+    if use_precip:
+        precip_source = st.selectbox(
+            "Fonte de dados de precipitação",
+            ["Ambas (GPM + CHIRPS)", "Apenas GPM", "Apenas CHIRPS"],
+            help="GPM: dados desde 2000 | CHIRPS: dados desde 1981"
+        )
+        
+        precip_years = st.multiselect(
+            "Anos para análise de precipitação",
+            options=years,
+            default=[2022, 2020, 2018, 2015],
+            help="Selecione os anos para comparar com precipitação"
+        )
+        
+        if not precip_years:
+            st.warning("Selecione pelo menos um ano para análise de precipitação")
     
     st.markdown("---")
     st.markdown("### 📊 Opções de Visualização")
@@ -190,23 +331,20 @@ with st.sidebar:
     
     download_mode = st.radio(
         "Modo de download:",
-        ["Raster único", "Múltiplos rasters"],
-        help="Escolha entre baixar um único raster ou vários de uma vez"
+        ["Raster único", "Múltiplos rasters"]
     )
     
     if download_mode == "Raster único":
         download_year = st.selectbox(
             "Ano para download do raster",
             options=years,
-            index=len(years)-1,
-            help="Selecione o ano para baixar o raster da bacia"
+            index=len(years)-1
         )
     else:
         download_years = st.multiselect(
             "Selecione os anos para download",
             options=years,
-            default=[2022, 2020, 2018],
-            help="Selecione múltiplos anos para download em lote"
+            default=[2022, 2020, 2018]
         )
     
     download_resolution = st.slider(
@@ -214,25 +352,12 @@ with st.sidebar:
         min_value=30,
         max_value=500,
         value=100,
-        step=10,
-        help="Resolução espacial para o download"
+        step=10
     )
     
-    # Opções adicionais para download múltiplo
     if download_mode == "Múltiplos rasters":
-        create_zip = st.checkbox(
-            "📦 Compactar em arquivo ZIP", 
-            value=True,
-            help="Cria um arquivo ZIP com todos os rasters selecionados"
-        )
-        
-        max_downloads = st.slider(
-            "Número máximo de rasters por download",
-            min_value=1,
-            max_value=10,
-            value=5,
-            help="Limite para evitar downloads muito grandes"
-        )
+        create_zip = st.checkbox("📦 Compactar em arquivo ZIP", value=True)
+        max_downloads = st.slider("Número máximo de rasters", min_value=1, max_value=10, value=5)
     
     st.markdown("---")
     st.markdown("### 📋 Informações da Bacia")
@@ -247,8 +372,8 @@ with st.sidebar:
     **💡 Sobre os dados:**
     - Fonte: MapBiomas Água Collection 4
     - Classe analisada: Água
-    - Resolução espacial: 30 metros
-    - Período: 1985–2024
+    - Precipitação GPM: NASA
+    - Precipitação CHIRPS: UCSB
     """)
 
 # ===================== FUNÇÃO DE CÁLCULO =====================
@@ -286,35 +411,28 @@ def download_raster_bacia(year, resolution, geometry):
         band_name = f"classification_{year}"
         water_band = water_image.select(band_name)
         
-        # Recortar para a bacia
         raster_clipped = water_band.clip(geometry)
         
-        # Configurar parâmetros de exportação
         export_params = {
             'scale': resolution,
             'region': geometry,
             'fileFormat': 'GeoTIFF',
-            'formatOptions': {
-                'cloudOptimized': True
-            }
+            'formatOptions': {'cloudOptimized': True}
         }
         
-        # Criar URL de download
         download_url = raster_clipped.getDownloadUrl(export_params)
-        
         return download_url, None
         
     except Exception as e:
         return None, str(e)
 
 def download_multiple_rasters(years, resolution, geometry, max_downloads=5):
-    """Baixa múltiplos rasters de uma vez e retorna URLs"""
+    """Baixa múltiplos rasters"""
     try:
         if len(years) > max_downloads:
-            return None, f"Selecione no máximo {max_downloads} anos por download"
+            return None, f"Selecione no máximo {max_downloads} anos"
         
         download_urls = {}
-        
         for year in years:
             download_url, error = download_raster_bacia(year, resolution, geometry)
             if download_url:
@@ -328,44 +446,28 @@ def download_multiple_rasters(years, resolution, geometry, max_downloads=5):
         return None, str(e)
 
 def create_zip_from_urls(download_urls):
-    """Cria um arquivo ZIP a partir dos URLs de download"""
+    """Cria ZIP a partir das URLs"""
     try:
         zip_buffer = BytesIO()
-        
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for year, url in download_urls.items():
-                # Fazer download do arquivo
                 response = requests.get(url)
                 if response.status_code == 200:
                     filename = f"agua_pericuma_{year}.tif"
                     zip_file.writestr(filename, response.content)
                 else:
-                    return None, f"Erro ao baixar arquivo do ano {year}"
-        
+                    return None, f"Erro no ano {year}"
         zip_buffer.seek(0)
         return zip_buffer, None
-        
     except Exception as e:
         return None, str(e)
-
-def get_individual_download_links(download_urls):
-    """Gera links individuais para download"""
-    links_html = ""
-    for year, url in download_urls.items():
-        links_html += f"""
-        <div style="margin: 5px 0;">
-            <strong>Ano {year}:</strong> 
-            <a href="{url}" target="_blank" style="margin-left: 10px;">📥 Baixar raster {year}</a>
-        </div>
-        """
-    return links_html
 
 # ===================== FUNÇÃO DE ANÁLISE DE CORRELAÇÃO =====================
 def analyze_correlation(df, method='Pearson'):
     """Realiza análise de correlação entre ano e área de água"""
     try:
         if len(df) < 2:
-            return None, "Dados insuficientes para análise de correlação"
+            return None, "Dados insuficientes"
         
         x = df['Ano'].values
         y = df['Área de Água (km²)'].values
@@ -379,22 +481,15 @@ def analyze_correlation(df, method='Pearson'):
         else:
             corr_coef, p_value = stats.pearsonr(x, y)
         
-        # Classificar a correlação
         abs_corr = abs(corr_coef)
         if abs_corr >= 0.7:
             strength = "Forte"
-            strength_class = "correlation-high"
         elif abs_corr >= 0.3:
             strength = "Moderada"
-            strength_class = "correlation-medium"
         else:
             strength = "Fraca"
-            strength_class = "correlation-low"
         
-        # Determinar direção
         direction = "positiva" if corr_coef > 0 else "negativa"
-        
-        # Calcular regressão linear para tendência
         slope, intercept = np.polyfit(x, y, 1)
         trend = "crescente" if slope > 0 else "decrescente"
         
@@ -404,7 +499,6 @@ def analyze_correlation(df, method='Pearson'):
             'força': strength,
             'direção': direction,
             'tendência': trend,
-            'classe_css': strength_class,
             'inclinação': slope
         }
         
@@ -430,8 +524,6 @@ with st.spinner("Carregando mapa..."):
         'width': 3
     }, 'Bacia do Pericumã')
 
-    m.add_basemap('OpenStreetMap')
-
     # Adicionar camadas de água para anos selecionados
     if selected_years:
         for year in selected_years:
@@ -440,23 +532,15 @@ with st.spinner("Carregando mapa..."):
                 water_clipped = water_mask.clip(geometry)
                 m.addLayer(
                     water_clipped,
-                    {
-                        'palette': ['00000000', '#1976D2'],
-                        'min': 0,
-                        'max': 1
-                    },
+                    {'palette': ['00000000', '#1976D2'], 'min': 0, 'max': 1},
                     f"Água {year} ({area_km2:.1f} km²)"
                 )
 
-    # Adicionar mapas base
     m.add_basemap('OpenStreetMap')
     m.add_basemap('Google Terrain')
     m.add_basemap('Google Satellite')
-    
-    # Adicionar controles do mapa
     m.add_layer_control()
 
-    # Container estilizado para o mapa
     st.markdown('<div class="map-container">', unsafe_allow_html=True)
     m.to_streamlit(height=500)
     st.markdown('</div>', unsafe_allow_html=True)
@@ -481,8 +565,138 @@ if selected_years:
     df = pd.DataFrame(stats_data).sort_values('Ano')
     
     if df["Área de Água (km²)"].sum() > 0:
+        
+        # ===================== SEÇÃO DE PRECIPITAÇÃO (NOVA) =====================
+        if use_precip and ee_initialized:
+            st.markdown("## 🌧️ Análise de Precipitação (GPM + CHIRPS)")
+            
+            # Determinar fonte baseada na seleção
+            source_map = {
+                "Ambas (GPM + CHIRPS)": "both",
+                "Apenas GPM": "gpm",
+                "Apenas CHIRPS": "chirps"
+            }
+            precip_source_code = source_map.get(precip_source, "both")
+            
+            # Definir período baseado nos anos selecionados
+            if precip_years:
+                start_date_precip = f"{min(precip_years)}-01-01"
+                end_date_precip = f"{max(precip_years)}-12-31"
+                
+                with st.spinner("Carregando dados de precipitação..."):
+                    precip_results, precip_errors = get_precip_series(
+                        start_date_precip, end_date_precip, geometry, precip_source_code
+                    )
+                
+                # Criar DataFrame combinado
+                dfs_to_plot = []
+                if precip_results.get('gpm') is not None:
+                    dfs_to_plot.append(precip_results['gpm'])
+                if precip_results.get('chirps') is not None:
+                    dfs_to_plot.append(precip_results['chirps'])
+                
+                if dfs_to_plot:
+                    precip_df = pd.concat(dfs_to_plot, ignore_index=True)
+                    
+                    # Gráfico de precipitação
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        fig_precip = px.bar(
+                            precip_df, 
+                            x='date', 
+                            y='precip', 
+                            color='source',
+                            title="Precipitação Mensal na Bacia",
+                            labels={'date': 'Mês/Ano', 'precip': 'Precipitação (mm)', 'source': 'Fonte'},
+                            barmode='group',
+                            color_discrete_map={'GPM': '#2196F3', 'CHIRPS': '#4CAF50'}
+                        )
+                        fig_precip.update_layout(
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)',
+                            height=400,
+                            xaxis_tickangle=-45
+                        )
+                        st.plotly_chart(fig_precip, use_container_width=True)
+                    
+                    with col2:
+                        # Resumo estatístico da precipitação
+                        st.markdown('<div class="precip-card">', unsafe_allow_html=True)
+                        st.markdown("### 📊 Resumo de Precipitação")
+                        
+                        for source in precip_df['source'].unique():
+                            source_data = precip_df[precip_df['source'] == source]
+                            st.markdown(f"""
+                            **{source}**:
+                            - Total acumulado: {source_data['precip'].sum():.1f} mm
+                            - Média mensal: {source_data['precip'].mean():.1f} mm
+                            - Máximo mensal: {source_data['precip'].max():.1f} mm
+                            """)
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    
+                    # Comparação com área de água (apenas anos comuns)
+                    st.markdown("### 🔗 Relação Precipitação x Área de Água")
+                    
+                    # Filtrar anos comuns
+                    common_years = set(precip_years) & set(df['Ano'].tolist())
+                    
+                    if common_years:
+                        # Agregar precipitação por ano
+                        precip_df['year'] = precip_df['date'].str[:4]
+                        annual_precip = precip_df.groupby(['year', 'source'])['precip'].sum().reset_index()
+                        annual_precip = annual_precip[annual_precip['year'].astype(int).isin(common_years)]
+                        
+                        # Merge com dados de área
+                        water_subset = df[df['Ano'].isin(common_years)].copy()
+                        water_subset['year'] = water_subset['Ano'].astype(str)
+                        
+                        merged_data = pd.merge(
+                            annual_precip, 
+                            water_subset[['year', 'Área de Água (km²)']], 
+                            on='year', 
+                            how='inner'
+                        )
+                        
+                        if not merged_data.empty:
+                            fig_relation = px.scatter(
+                                merged_data,
+                                x='precip',
+                                y='Área de Água (km²)',
+                                color='source',
+                                size='precip',
+                                title="Relação Precipitação Anual x Área de Água",
+                                labels={'precip': 'Precipitação Anual (mm)', 'Área de Água (km²)': 'Área de Água (km²)'},
+                                trendline="ols"
+                            )
+                            fig_relation.update_layout(
+                                plot_bgcolor='rgba(0,0,0,0)',
+                                paper_bgcolor='rgba(0,0,0,0)',
+                                height=500
+                            )
+                            st.plotly_chart(fig_relation, use_container_width=True)
+                            
+                            # Calcular correlação precipitação-água
+                            for source in merged_data['source'].unique():
+                                source_data = merged_data[merged_data['source'] == source]
+                                if len(source_data) > 2:
+                                    corr = source_data['precip'].corr(source_data['Área de Água (km²)'])
+                                    st.markdown(f"""
+                                    <div class="info-box">
+                                        <strong>📊 Correlação ({source} vs Área de Água):</strong> r = {corr:.3f}
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                    
+                else:
+                    st.warning("Não foi possível carregar dados de precipitação para o período selecionado.")
+                    if precip_errors:
+                        st.info(f"Detalhes técnicos: {precip_errors}")
+            else:
+                st.info("Selecione anos na barra lateral para análise de precipitação.")
+
         # ===================== ANÁLISE DE CORRELAÇÃO =====================
-        st.markdown("## 🔍 Análise de Correlação")
+        st.markdown("## 🔍 Análise de Correlação (Temporal)")
         
         correlation_result, error = analyze_correlation(df, correlation_method)
         
@@ -491,7 +705,7 @@ if selected_years:
             
             with col1:
                 st.markdown(f"""
-                <div class="metric-card {correlation_result['classe_css']}">
+                <div class="metric-card">
                     <h3>Coeficiente de Correlação ({correlation_method})</h3>
                     <h2>{correlation_result['coeficiente']:.3f}</h2>
                     <p>Força: {correlation_result['força']}</p>
@@ -508,7 +722,6 @@ if selected_years:
             with col4:
                 st.metric("Tendência", correlation_result['tendência'].title())
             
-            # Interpretação da correlação
             st.markdown(f"""
             <div class="info-box">
                 <h4>📊 Interpretação da Correlação:</h4>
@@ -519,20 +732,17 @@ if selected_years:
                 <strong>{abs(correlation_result['inclinação']):.3f} km²/ano</strong>.</p>
             </div>
             """, unsafe_allow_html=True)
-        
         else:
             st.warning(f"Não foi possível calcular a correlação: {error}")
 
         # ===================== GRÁFICOS =====================
         st.markdown("## 📈 Análise Temporal da Água")
         
-        # Container principal para gráficos
         col1, col2 = st.columns([2, 1])
         
         with col1:
             st.markdown("### Evolução da Área de Água")
             
-            # Gráfico de linha suave com tendência
             fig_line = px.line(
                 df, 
                 x="Ano", 
@@ -543,8 +753,7 @@ if selected_years:
                 line_shape='spline' if smooth_lines else 'linear'
             )
             
-            if show_trendline:
-                # Adicionar linha de tendência
+            if show_trendline and correlation_result:
                 z = np.polyfit(df['Ano'], df['Área de Água (km²)'], 1)
                 p = np.poly1d(z)
                 trend_line = p(df['Ano'])
@@ -553,9 +762,8 @@ if selected_years:
                     x=df['Ano'],
                     y=trend_line,
                     mode='lines',
-                    name=f'Tendência (r = {correlation_result["coeficiente"]:.3f})' if correlation_result else 'Tendência',
-                    line=dict(color='#FF5252', dash='dash', width=2),
-                    hoverinfo='skip'
+                    name=f'Tendência (r = {correlation_result["coeficiente"]:.3f})',
+                    line=dict(color='#FF5252', dash='dash', width=2)
                 ))
             
             fig_line.update_layout(
@@ -566,11 +774,7 @@ if selected_years:
                 showlegend=True
             )
             
-            fig_line.update_traces(
-                line=dict(width=4),
-                marker=dict(size=8)
-            )
-            
+            fig_line.update_traces(line=dict(width=4), marker=dict(size=8))
             st.plotly_chart(fig_line, use_container_width=True)
         
         with col2:
@@ -580,16 +784,14 @@ if selected_years:
             latest_data = df[df['Ano'] == latest_year].iloc[0]
             oldest_data = df[df['Ano'] == min(selected_years)].iloc[0]
             
-            # Cartões de métricas
             st.markdown(f"""
             <div class="metric-card">
-                <h3> Área de Água ({latest_year})</h3>
+                <h3>📊 Área de Água ({latest_year})</h3>
                 <h2>{latest_data['Área de Água (km²)']:,.1f} km²</h2>
                 <p>{latest_data['Percentual de Água (%)']:.2f}% da bacia</p>
             </div>
             """, unsafe_allow_html=True)
             
-            # Variação
             variation = ((latest_data['Área de Água (km²)'] - oldest_data['Área de Água (km²)']) / 
                        oldest_data['Área de Água (km²)']) * 100 if oldest_data['Área de Água (km²)'] > 0 else 0
             
@@ -603,19 +805,9 @@ if selected_years:
                 <p>Evolução no período</p>
             </div>
             """, unsafe_allow_html=True)
-            
-            # Métrica de correlação se disponível
-            if correlation_result:
-                st.markdown(f"""
-                <div class="metric-card {correlation_result['classe_css']}">
-                    <h3>📊 Correlação</h3>
-                    <h2>{correlation_result['coeficiente']:.3f}</h2>
-                    <p>{correlation_result['força']} • {correlation_result['direção']}</p>
-                </div>
-                """, unsafe_allow_html=True)
         
-        # Gráfico de dispersão com linha de correlação
-        st.markdown("### Gráfico de Dispersão com Correlação")
+        # Gráfico de dispersão
+        st.markdown("### 📊 Gráfico de Dispersão com Correlação")
         
         fig_scatter = px.scatter(
             df, 
@@ -643,90 +835,46 @@ if selected_years:
         
         if download_mode == "Raster único":
             col1, col2 = st.columns([3, 1])
-            
             with col1:
                 st.markdown(f"**Configuração atual:** Ano {download_year}, Resolução: {download_resolution}m")
-            
             with col2:
                 if st.button("🗂️ Baixar Raster Único", use_container_width=True):
-                    with st.spinner(f"Preparando download do raster {download_year}..."):
+                    with st.spinner(f"Preparando download..."):
                         download_url, error = download_raster_bacia(download_year, download_resolution, geometry)
-                        
                         if download_url:
-                            st.success(f"✅ Raster de {download_year} preparado para download!")
-                            st.markdown(f"""
-                            <div class="success-box">
-                                <h4>📋 Detalhes do Download:</h4>
-                                <p><strong>Ano:</strong> {download_year}</p>
-                                <p><strong>Resolução:</strong> {download_resolution} metros</p>
-                                <p><strong>Formato:</strong> GeoTIFF</p>
-                                <p><strong>Tamanho estimado:</strong> ~10-50 MB</p>
-                                <p><a href="{download_url}" target="_blank" style="color: #2196F3; font-weight: bold;">🎯 Clique aqui para baixar o arquivo</a></p>
-                            </div>
-                            """, unsafe_allow_html=True)
+                            st.success(f"✅ Raster de {download_year} preparado!")
+                            st.markdown(f'<a href="{download_url}" target="_blank">🎯 Clique aqui para baixar</a>', unsafe_allow_html=True)
                         else:
-                            st.error(f"❌ Erro ao preparar download: {error}")
+                            st.error(f"❌ Erro: {error}")
         
-        else:  # Múltiplos rasters
-            if not download_years:
-                st.warning("⚠️ Selecione pelo menos um ano para download múltiplo.")
-            else:
-                if len(download_years) > max_downloads:
-                    st.error(f"⚠️ Selecione no máximo {max_downloads} anos por download.")
-                else:
-                    col1, col2 = st.columns([3, 1])
-                    
-                    with col1:
-                        st.markdown(f"**Configuração atual:** {len(download_years)} anos selecionados, Resolução: {download_resolution}m")
-                        st.markdown(f"**Anos:** {', '.join(map(str, sorted(download_years)))}")
-                    
-                    with col2:
-                        download_button_text = "📦 Baixar ZIP" if create_zip else "🗂️ Baixar Rasters"
-                        if st.button(download_button_text, use_container_width=True):
-                            with st.spinner(f"Preparando download de {len(download_years)} rasters..."):
-                                download_urls, error = download_multiple_rasters(
-                                    download_years, download_resolution, geometry, max_downloads
-                                )
-                                
-                                if download_urls:
-                                    if create_zip:
-                                        # Criar arquivo ZIP
-                                        zip_buffer, error = create_zip_from_urls(download_urls)
-                                        if zip_buffer:
-                                            st.success(f"✅ ZIP com {len(download_urls)} rasters preparado!")
-                                            
-                                            # Botão para download do ZIP
-                                            zip_filename = f"rasters_pericuma_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
-                                            st.download_button(
-                                                label="📥 Baixar Arquivo ZIP",
-                                                data=zip_buffer.getvalue(),
-                                                file_name=zip_filename,
-                                                mime="application/zip",
-                                                use_container_width=True
-                                            )
-                                            
-                                            st.markdown(f"""
-                                            <div class="success-box">
-                                                <h4>📦 Conteúdo do ZIP:</h4>
-                                                <p><strong>Arquivos incluídos:</strong> {len(download_urls)} rasters</p>
-                                                <p><strong>Anos:</strong> {', '.join(map(str, sorted(download_years)))}</p>
-                                                <p><strong>Resolução:</strong> {download_resolution}m</p>
-                                                <p><strong>Tamanho estimado:</strong> ~{len(download_urls)*20} MB</p>
-                                            </div>
-                                            """, unsafe_allow_html=True)
-                                        else:
-                                            st.error(f"❌ Erro ao criar ZIP: {error}")
-                                    else:
-                                        # Links individuais
-                                        st.success(f"✅ {len(download_urls)} rasters preparados para download!")
-                                        st.markdown(f"""
-                                        <div class="success-box">
-                                            <h4>🔗 Links de Download Individuais:</h4>
-                                            {get_individual_download_links(download_urls)}
-                                        </div>
-                                        """, unsafe_allow_html=True)
+        else:
+            if download_years and len(download_years) <= max_downloads:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown(f"**Configuração:** {len(download_years)} anos, Resolução: {download_resolution}m")
+                with col2:
+                    if st.button("📦 Baixar Rasters", use_container_width=True):
+                        with st.spinner("Preparando..."):
+                            download_urls, error = download_multiple_rasters(
+                                download_years, download_resolution, geometry, max_downloads
+                            )
+                            if download_urls:
+                                if create_zip:
+                                    zip_buffer, error = create_zip_from_urls(download_urls)
+                                    if zip_buffer:
+                                        st.download_button(
+                                            label="📥 Baixar ZIP",
+                                            data=zip_buffer.getvalue(),
+                                            file_name=f"rasters_pericuma_{datetime.now().strftime('%Y%m%d')}.zip",
+                                            mime="application/zip"
+                                        )
                                 else:
-                                    st.error(f"❌ Erro ao preparar downloads: {error}")
+                                    for year, url in download_urls.items():
+                                        st.markdown(f"**[{year}]** [📥 Baixar]({url})")
+                            else:
+                                st.error(f"❌ Erro: {error}")
+            elif len(download_years) > max_downloads:
+                st.error(f"⚠️ Selecione no máximo {max_downloads} anos.")
         
         st.markdown('</div>', unsafe_allow_html=True)
         
@@ -746,7 +894,6 @@ if selected_years:
             )
         
         with col2:
-            # Download do relatório de correlação
             if correlation_result:
                 report_text = f"""
 RELATÓRIO DE ANÁLISE - BACIA DO RIO PERICUMÃ
@@ -754,21 +901,20 @@ Data: {datetime.now().strftime('%d/%m/%Y %H:%M')}
 Método de correlação: {correlation_method}
 
 RESULTADOS DA CORRELAÇÃO:
-- Coeficiente de correlação: {correlation_result['coeficiente']:.3f}
+- Coeficiente: {correlation_result['coeficiente']:.3f}
 - Valor-p: {correlation_result['p_valor']:.4f}
 - Força: {correlation_result['força']}
 - Direção: {correlation_result['direção']}
-- Tendência: {correlation_result['tendência']}
 - Inclinação: {correlation_result['inclinação']:.3f} km²/ano
 
-DADOS BRUTOS:
+DADOS:
 {df.to_string(index=False)}
                 """
                 
                 st.download_button(
-                    "📋 Baixar Relatório de Correlação",
+                    "📋 Baixar Relatório",
                     data=report_text.encode('utf-8'),
-                    file_name=f"relatorio_correlacao_pericuma_{datetime.now().strftime('%Y%m%d')}.txt",
+                    file_name=f"relatorio_correlacao_{datetime.now().strftime('%Y%m%d')}.txt",
                     mime="text/plain",
                     use_container_width=True
                 )
@@ -780,18 +926,6 @@ DADOS BRUTOS:
         
         with col1:
             st.markdown("### Dados Completos")
-            
-            # Aplicar estilo baseado na correlação
-            def style_correlation(val):
-                if correlation_result:
-                    if abs(correlation_result['coeficiente']) >= 0.7:
-                        return 'background-color: #E8F5E8'
-                    elif abs(correlation_result['coeficiente']) >= 0.3:
-                        return 'background-color: #FFF8E1'
-                    else:
-                        return 'background-color: #FFEBEE'
-                return ''
-            
             styled_df = df.style.format({
                 "Área de Água (km²)": "{:,.2f}",
                 "Área Total da Bacia (km²)": "{:,.2f}",
@@ -808,27 +942,21 @@ DADOS BRUTOS:
                 "Máximo": df["Área de Água (km²)"].max(),
                 "Mínimo": df["Área de Água (km²)"].min(),
                 "Desvio Padrão": df["Área de Água (km²)"].std(),
-                "Coeficiente de Variação": (df["Área de Água (km²)"].std() / df["Área de Água (km²)"].mean()) * 100,
-                "Variação Total": f"{variation:+.1f}%"
+                "Coeficiente de Variação": (df["Área de Água (km²)"].std() / df["Área de Água (km²)"].mean()) * 100
             }
             
             for key, value in stats_summary.items():
-                if isinstance(value, float):
-                    if key == "Coeficiente de Variação":
-                        st.metric(key, f"{value:.1f}%")
-                    else:
-                        st.metric(key, f"{value:,.2f} km²")
+                if key == "Coeficiente de Variação":
+                    st.metric(key, f"{value:.1f}%")
                 else:
-                    st.metric(key, value)
+                    st.metric(key, f"{value:,.2f} km²")
 
 # ===================== RODAPÉ =====================
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666; padding: 2rem 0;">
-    <p>🌍 <strong>Análise de Água - Bacia do Rio Pericumã</strong></p>
-    <p>Desenvolvido com MapBiomas Água Collection 4 e Google Earth Engine</p>
-    <p>📅 Dados atualizados: 1985-2023 | 📏 Resolução: 30 metros</p>
-    <p>🔍 Análise de correlação: Pearson, Spearman e Kendall</p>
-    <p>💾 Download: Rasters individuais ou múltiplos em lote</p>
+    <p>🌍 <strong>Análise de Água + Precipitação - Bacia do Rio Pericumã</strong></p>
+    <p>Desenvolvido com MapBiomas Água Collection 4, Google Earth Engine, GPM e CHIRPS</p>
+    <p>🌧️ GPM (NASA) | 🌧️ CHIRPS (UCSB)</p>
 </div>
 """, unsafe_allow_html=True)
